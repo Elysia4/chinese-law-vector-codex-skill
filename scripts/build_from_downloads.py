@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""从手工批量下载的官方文档构建语料（来源：国家法律法规数据库导出的 docx）。
+"""从官方 docx 构建语料（来源：国家法律法规数据库导出的 docx）。
 
-为什么这么做：flk 的 robots.txt 明确禁止自动化采集，所以正文不由脚本抓取，
-改为用户在官网用"批量下载"功能人工导出，本脚本只做本地解析与结构化。
+正文怎么来：默认用 `scripts/fetch_downloads.py` 自动抓取官方 docx（走官网公开
+接口，取回的就是官网"批量下载"给出的那批文件与文件名）；也支持把人工用"批量
+下载"导出的 zip 放进 downloads/。两条路径产物一致，本脚本只做本地解析与结构化。
 
 输入（--source 可重复指定；默认取技能目录下的 downloads/ 三个子目录）
   downloads/法律语料、downloads/行政法规、downloads/司法解释
-  目录里是官网"批量下载"导出的 zip，每个 zip 内含若干 <标题>_<YYYYMMDD>.docx
+  目录里是官方 docx 的 zip（由 scripts/fetch_downloads.py 爬取），内含若干 <标题>_<YYYYMMDD>.docx
 
 处理流程
   1. 解包所有 zip，读出每个文件的字节
@@ -668,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"      共 {len(files)} 个文件")
     if not files:
         print("\n没有找到任何下载文件。两种做法：")
-        print("  1) 把官网批量下载的 zip 放进技能目录下的 downloads/")
+        print("  1) 跑 scripts/fetch_downloads.py 自动抓取，或把官网批量下载的 zip 放进 downloads/")
         print("     （三个子目录：法律语料 / 行政法规 / 司法解释）")
         print('  2) 或用 --source 指定目录，可重复：')
         print('     python scripts/build_from_downloads.py --source "D:\\我的下载\\法律语料"')
@@ -916,7 +917,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {
         "generated_by": "scripts/build_from_downloads.py",
         "retrieved": time.strftime("%Y-%m-%d"),
-        "text_source": "国家法律法规数据库手工批量下载导出（docx/pdf），本地解析",
+        "text_source": "国家法律法规数据库官方 docx（scripts/fetch_downloads.py 爬取），本地解析",
         "count": len(manifest_records),
         "by_layer": dict(Counter(r["layer"] for r in manifest_records)),
         "by_status": dict(Counter(r["status"] for r in manifest_records)),
