@@ -1,0 +1,28 @@
+# ── 向量索引：本机生成，约 103 MB ──────────────────────────────
+# 1) 超过 GitHub 单文件 100 MB 硬上限，push 会被拒绝
+# 2) 与具体嵌入模型绑定（qwen3-embedding:0.6b / 1024 维），换模型即失效
+# 3) 使用说明见 references/vector-index.md
+references/corpus/vectors.npz
+references/corpus/vectors.meta.json
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 测试与打包产物 ──────────────────────────────────────────
+work/
+outputs/
+*.zip
+*.log
+
+# ── 本地下载的官方文档（用于重建语料，体积大且含个人信息无关）──
+downloads/
+
+# ── 编辑器与系统 ────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

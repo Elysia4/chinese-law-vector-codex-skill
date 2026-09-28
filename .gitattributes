@@ -1,0 +1,11 @@
+# 统一换行符：仓库内一律用 LF，检出时按平台自动转换
+# 避免 Windows 上出现大量 "LF will be replaced by CRLF" 警告，
+# 也避免语料文件在不同平台上产生无意义的整文件 diff。
+* text=auto
+
+# 语料是纯文本，明确按文本处理
+references/corpus/** text
+
+# 二进制/生成物不参与换行转换
+*.npz binary
+*.zip binary

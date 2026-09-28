@@ -1,0 +1,4 @@
+interface:
+  display_name: "中国法律"
+  short_description: "中华人民共和国现行有效法律全文检索、条文引用与效力判断"
+  default_prompt: "查询中华人民共和国法律的现行条文，给出准确的条文依据与效力判断"
