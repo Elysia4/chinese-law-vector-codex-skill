@@ -14,6 +14,15 @@
   python scripts/rank_search.py --law 民法典 房东不退押金
   python scripts/rank_search.py --top 5 高空抛物砸到人谁赔
   python scripts/rank_search.py --verbose 大数据杀熟
+
+多路召回（推荐：由主模型把口语问题改写成法条用语后一并传入）
+  python scripts/rank_search.py "房东不退我押金" \
+      --extra-query "租赁合同约定的保证金未依法返还" --extra-query "出租人拒绝退还保证金构成违约"
+
+  · 为什么要改写：用户说人话、法条说法言法语，词面对不上就召不回（"押金"↔"保证金返还"、
+    "过了几年"↔"诉讼时效"）。实测两套各 100 题：主模型改写 @5 89%（不改写只有 32%），
+    且优于本地 4B 小模型（82%），还不需要用户装任何额外模型。
+  · 弱的改写会倒扣分：本地 4B 改写把 @1 从 41% 拖到 36%，所以改写要用法条用词、不要复述口语。
 """
 
 from __future__ import annotations
@@ -517,7 +526,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("query", nargs="+", help="自然语言问题或关键词")
     parser.add_argument("--law", default=None, help="限定法律名称（可用简称）")
-    parser.add_argument("--top", type=int, default=8, help="返回条数上限")
+    # 默认 20：实测（30 题）读取窗口取前 8 条时正确条文命中 63.3%，放宽到前 20 条是
+    # 80.0%——多读十几条是目前最便宜的一次召回提升，所以直接把它设成默认值。
+    parser.add_argument("--top", type=int, default=20, help="返回条数上限（默认 20）")
+    parser.add_argument(
+        "--extra-query", action="append", default=None,
+        help="把口语问题改写成的法条用语表述（可重复传）。与原问题一起做多路召回再 RRF 融合",
+    )
     parser.add_argument("--chars", type=int, default=500, help="每条条文显示的字数上限")
     parser.add_argument("--verbose", action="store_true", help="显示词项与命中统计（排查用）")
     parser.add_argument("--no-vector", action="store_true", help="只用 BM25，不做向量融合")
@@ -646,7 +661,45 @@ def main(argv: list[str] | None = None) -> int:
     if caution:
         print(caution)
 
-    if not bm25_ranked and not vector_hits:
+    # 多路召回：主模型把口语问题改写成多条法条用语表述后一并传入（--extra-query）。
+    # 每一路各自做 BM25(+向量) 融合，再把各路按 RRF 合并。两套各 100 题实测：
+    # 主模型改写优于本地小模型改写（@1 +24 点、@5 +7 点），且用户端不需要任何额外模型
+    # ——详见 eval/results.md 与 docs/技术选型输入-2026-09-29.md。
+    extra_queries = [
+        q.strip() for q in (args.extra_query or []) if q.strip() and q.strip() != args.text
+    ]
+    merged_mode = bool(extra_queries) and (bool(bm25_ranked) or bool(vector_hits))
+    if merged_mode:
+        routes: list[tuple[str, list, list]] = [(args.text, bm25_ranked, vector_hits)]
+        for extra in extra_queries:
+            extra_terms, _extra_added = build_terms(extra, expansions)
+            extra_bm25 = search(documents, extra_terms, False)
+            extra_vec: list[tuple[str, float]] = []
+            if vector_hits:  # 主路用上了向量，说明向量可用，改写路也一起走向量
+                try:
+                    extra_vec = vector_ranking(index, extra, args.ollama_url)
+                except Exception:  # noqa: BLE001 - 单路失败不影响整次检索
+                    extra_vec = []
+            routes.append((extra, extra_bm25, extra_vec))
+        merged_scores: dict[str, float] = {}
+        merged_docs: dict[str, tuple] = {}
+        for _query, route_bm25, route_vec in routes:
+            ordered = (
+                [doc for _b, _v, _c, doc in fuse(documents, route_bm25, route_vec)]
+                if route_vec
+                else [doc for _s, doc in route_bm25]
+            )
+            for rank, doc in enumerate(ordered[:100], start=1):
+                key = doc_key(doc)
+                merged_docs[key] = doc
+                merged_scores[key] = merged_scores.get(key, 0.0) + 1.0 / (60 + rank)
+        results = [
+            (score, None, 0.0, merged_docs[key])
+            for key, score in sorted(merged_scores.items(), key=lambda kv: -kv[1])
+        ]
+        order_note = f"多路召回 RRF（{len(routes)} 路：原问题 + {len(extra_queries)} 条改写）"
+
+    if not merged_mode and not bm25_ranked and not vector_hits:
         print(f"\n在 {len(documents)} 条条文中没有命中任何词项。")
         print("可尝试：换成法条用词、用 --law 限定法律、加 --verbose 看哪些词没命中，")
         print("或改用 scripts/search_corpus.py --list 按法律名查找。")
@@ -657,17 +710,23 @@ def main(argv: list[str] | None = None) -> int:
             print(live_hint(args.text))
         return 1
 
-    if vector_hits:
+    if merged_mode:
+        pass  # results 已在多路分支里算好
+    elif vector_hits:
         results = fuse(documents, bm25_ranked, vector_hits)
         order_note = "BM25 与向量 RRF 融合排序"
     else:
         results = [(score, None, 0.0, doc) for score, doc in bm25_ranked]
         order_note = "BM25 相关性排序"
 
+    if merged_mode:
+        print(f"\n多路召回：原问题 + {len(extra_queries)} 条改写")
+        for extra in extra_queries:
+            print(f"  · {extra}")
     print(f"\n命中 {len(results)} 条 / 可检索条文 {len(documents)} 条（{order_note}）：\n")
     for order, (score, similarity, _, doc) in enumerate(results[: args.top], start=1):
         title, category, article, chapter, body, file, line, status, layer = doc
-        signal = f"BM25 {score:.1f}"
+        signal = f"多路 RRF {score:.4f}" if merged_mode else f"BM25 {score:.1f}"
         if similarity is not None:
             signal += f" ｜ 向量 {similarity:.3f}"
         flag = "" if layer == "current" else "⚠️ "

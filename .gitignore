@@ -26,3 +26,9 @@ downloads/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 地方法规元数据（由 scripts/fetch_local_meta.py 生成，约 13MB）
+references/local-regulations.jsonl
+
+# 自适应限流的断点状态（运行时产物，位置随脚本的 --out 变化）
+references/.rate_state.json

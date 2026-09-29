@@ -35,7 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from build_from_downloads import CATEGORIES, fetch_official  # noqa: E402
-from fetch_corpus import http_get, http_json  # noqa: E402
+from fetch_corpus import LIMITER, http_get, http_json  # noqa: E402
 
 FLK = "https://flk.npc.gov.cn"
 BATCH_API = f"{FLK}/law-search/download/batch"
@@ -46,12 +46,19 @@ GROUPS = {
     "法律语料": {100, 110, 120, 130, 140, 150, 155, 160, 170, 180, 190, 195, 200, 220},
     "行政法规": {210, 215},
     "司法解释": {320, 330, 340, 350},
+    # 地方法规约 2.8 万件（地方性法规 23475 + 修改废止决定 1958 + 单行条例 1471
+    # + 经济特区法规 800 + 法规性决定 409 + 自治条例 222 + 海南自贸港 54 + 浦东 30），
+    # 是国家层面的 11 倍，默认不抓，用 --all 或 --groups 地方法规 显式打开。
+    "地方法规": {230, 260, 270, 290, 295, 300, 305, 310},
 }
-GROUP_ORDER = ["法律语料", "行政法规", "司法解释"]
+GROUP_ORDER = ["法律语料", "行政法规", "司法解释", "地方法规"]
+DEFAULT_GROUPS = ("法律语料", "行政法规", "司法解释")
 CODE_TO_GROUP = {code: name for name, codes in GROUPS.items() for code in codes}
+LOCAL_GROUPS = ("地方法规",)
 
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "downloads"
 STATE_NAME = ".fetch_state.json"
+CHECKLIST_NAME = ".official_checklist.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -118,6 +125,7 @@ def save_state(path: Path, state: dict[str, str]) -> None:
 
 def merge_zip(zip_path: Path, entries: dict[str, bytes]) -> int:
     """把 {文件名: 字节} 并入 zip（同名覆盖），先写临时文件再原子替换。"""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
     merged: dict[str, bytes] = {}
     if zip_path.exists():
         with zipfile.ZipFile(zip_path) as zf:
@@ -138,10 +146,42 @@ def merge_zip(zip_path: Path, entries: dict[str, bytes]) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def build_checklist(groups: set[str]) -> list[dict]:
+def load_checklist_cache(path: Path, max_age_days: float = 7.0) -> dict | None:
+    """读官方清单缓存；过期或损坏就返回 None（重新抓）。"""
+    if not path.exists():
+        return None
+    age_days = (time.time() - path.stat().st_mtime) / 86400
+    if age_days > max_age_days:
+        print(f"  清单缓存已过期（{age_days:.1f} 天），重新抓取")
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        official = {(row["title"], row["date"]): row["meta"] for row in raw}
+    except (OSError, ValueError, KeyError, TypeError):
+        print("  清单缓存损坏，重新抓取")
+        return None
+    print(f"  复用清单缓存（{age_days:.1f} 天前，{len(official)} 条）：{path.name}")
+    return official
+
+
+def save_checklist_cache(path: Path, official: dict) -> None:
+    rows = [{"title": t, "date": d, "meta": m} for (t, d), m in official.items()]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def build_checklist(groups: set[str], cache_path: Path, refresh: bool) -> list[dict]:
     """官方清单 → 待抓列表（只保留有 bbbs 的条目）。"""
-    print("拉取官方清单…")
-    official = fetch_official()
+    official = None if refresh else load_checklist_cache(cache_path)
+    if official is None:
+        print("拉取官方清单…")
+        official = fetch_official()
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            save_checklist_cache(cache_path, official)
+        except OSError as exc:
+            print(f"  ⚠ 清单缓存写入失败（不影响抓取）：{exc}")
     items = []
     for (title, date), meta in official.items():
         if not meta.get("bbbs"):
@@ -180,16 +220,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="爬取官方库 docx")
     parser.add_argument("--out", default=None, help=f"输出目录（默认 {DEFAULT_OUT}）")
     parser.add_argument("--groups", default=None, help="只抓指定分组，逗号分隔：" + "/".join(GROUP_ORDER))
+    parser.add_argument("--all", action="store_true", help="连地方法规一起抓（约 2.8 万件，耗时数小时、体积上 GB）")
     parser.add_argument("--limit", type=int, default=0, help="最多抓多少条（试跑用，默认全部）")
     parser.add_argument("--batch", type=int, default=50, help="每批向接口提交多少条（默认 50）")
     parser.add_argument("--delay", type=float, default=0.2, help="每次请求后的等待秒数（默认 0.2）")
+    parser.add_argument("--min-interval", type=float, default=0.35, help="自适应节流的起始/最快请求间隔（秒）")
+    parser.add_argument("--max-interval", type=float, default=120.0, help="被限流时允许放慢到的最大间隔（秒）")
+    parser.add_argument("--retry-rounds", type=int, default=2, help="主流程结束后补抓失败条目的轮数（默认 2）")
+    parser.add_argument("--retry-pause", type=float, default=120.0, help="两轮补抓之间的等待秒数（默认 120）")
     parser.add_argument("--timeout", type=int, default=60, help="单次请求超时秒数")
     parser.add_argument("--dry-run", action="store_true", help="只统计清单，不下载")
     parser.add_argument("--force", action="store_true", help="忽略断点记录，重抓全部")
+    parser.add_argument("--refresh-list", action="store_true", help="忽略清单缓存，重新拉官方清单")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     out_root = Path(args.out).expanduser().resolve() if args.out else DEFAULT_OUT
-    groups = set(GROUP_ORDER)
+    groups = set(GROUP_ORDER) if args.all else set(DEFAULT_GROUPS)
     if args.groups:
         groups = {g.strip() for g in args.groups.split(",") if g.strip()}
         unknown = groups - set(GROUP_ORDER)
@@ -197,7 +243,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"未知分组：{'、'.join(sorted(unknown))}（可选：{'、'.join(GROUP_ORDER)}）")
             return 2
 
-    items = build_checklist(groups)
+    # 自适应节流：被 WAF 拦就翻倍退让，连续成功再缓慢收回；间隔学到的值会记在
+    # downloads/.rate_state.json，重跑时从那里起步，不重新踩一遍限流的坑。
+    LIMITER.min_interval = args.min_interval
+    LIMITER.max_interval = args.max_interval
+    LIMITER.state_path = out_root / ".rate_state.json"
+    LIMITER._load()
+    print(f"自适应节流：当前间隔 {LIMITER.interval:.2f}s（区间 {args.min_interval:.2f}–{args.max_interval:.2f}s）")
+
+    items = build_checklist(groups, out_root / CHECKLIST_NAME, args.refresh_list)
     per_group = {name: sum(1 for item in items if item["group"] == name) for name in GROUP_ORDER}
     print()
     for name in GROUP_ORDER:
@@ -227,52 +281,64 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n开始抓取 {len(pending)} 条，输出到 {out_root}")
     buffers: dict[str, dict[str, bytes]] = {name: {} for name in GROUP_ORDER}
-    failures: list[tuple[str, str]] = []
-    done = 0
-    for start in range(0, len(pending), max(1, args.batch)):
-        chunk = pending[start : start + max(1, args.batch)]
+    failures: list[tuple[str, dict, str]] = []
+    counter = {"done": 0}
+
+    def flush() -> None:
+        """每批落盘一次，中途被杀也不丢已抓的。"""
+        out_root.mkdir(parents=True, exist_ok=True)
+        for group, entries in buffers.items():
+            if entries:
+                path = out_root / group / f"国家法律法规数据库_{group}.zip"
+                total = merge_zip(path, entries)
+                buffers[group] = {}
+                print(f"  ✓ {group}：本批写入 {len(entries)} 条，zip 累计 {total} 条")
+        save_state(state_path, state)
+
+    def process(chunk: list[dict]) -> None:
         try:
             rows = request_links(chunk, timeout=args.timeout)
         except Exception as exc:  # noqa: BLE001 - 整批失败就退化成逐条，不中断全程
-            print(f"  ⚠ 第 {start // max(1, args.batch) + 1} 批换链接失败（{exc}），改为逐条重试")
+            print(f"      ⚠ 本批换链接失败（{exc}），改为逐条重试")
             rows = []
         time.sleep(args.delay)
 
         for index, item in enumerate(chunk):
             row = rows[index] if index < len(rows) else None
             name = official_filename(row.get("url", ""), row.get("urlIn", "")) if row else None
-            if not row or not name:
-                try:
+            try:
+                if not row or not name:
                     name, data = fetch_one(item, args.timeout, args.delay)
-                except Exception as exc:  # noqa: BLE001
-                    failures.append((f"{item['title']}（{item['date']}）", str(exc)))
-                    continue
-            else:
-                try:
+                else:
                     data = http_get(row["url"], timeout=args.timeout)
                     time.sleep(args.delay)
-                except Exception as exc:  # noqa: BLE001
-                    failures.append((f"{item['title']}（{item['date']}）", str(exc)))
-                    continue
+            except Exception as exc:  # noqa: BLE001
+                failures.append((f"{item['title']}（{item['date']}）", item, str(exc)))
+                continue
             buffers[item["group"]][name] = data
             state[item["bbbs"]] = name
-            done += 1
-            if done % 50 == 0 or done == len(pending):
-                print(f"  … 已抓 {done}/{len(pending)}")
+            counter["done"] += 1
+            if counter["done"] % 50 == 0:
+                print(f"  … 已抓 {counter['done']}/{len(pending)}")
+        flush()
 
-        # 每批落盘一次，中途中断也不丢已抓的
-        out_root.mkdir(parents=True, exist_ok=True)
-        for name, entries in buffers.items():
-            if entries:
-                total = merge_zip(out_root / name / f"国家法律法规数据库_{name}.zip", entries)
-                buffers[name] = {}
-                print(f"  ✓ {name}：本批写入 {len(entries)} 条，zip 累计 {total} 条")
-        save_state(state_path, state)
+    for start in range(0, len(pending), max(1, args.batch)):
+        process(pending[start : start + max(1, args.batch)])
 
-    out_root.mkdir(parents=True, exist_ok=True)
-    save_state(state_path, state)
-    print(f"\n完成：成功 {done} 条，失败 {len(failures)} 条")
-    for title, reason in failures[:20]:
+    # 失败补抓：限流是间歇性的，隔开一段时间再试能救回大部分
+    for round_no in range(1, max(0, args.retry_rounds) + 1):
+        if not failures:
+            break
+        retry_items = [item for _, item, _ in failures]
+        failures = []
+        print(f"\n第 {round_no} 轮补抓：{len(retry_items)} 条（先等 {args.retry_pause:.0f}s 让限流窗口过去）")
+        time.sleep(args.retry_pause)
+        for start in range(0, len(retry_items), max(1, args.batch)):
+            process(retry_items[start : start + max(1, args.batch)])
+
+    flush()
+    print(f"\n完成：成功 {counter['done']} 条，失败 {len(failures)} 条")
+    for title, _item, reason in failures[:20]:
         print(f"  ✗ {title}：{reason}")
     if len(failures) > 20:
         print(f"  … 另有 {len(failures) - 20} 条失败（多为官网未提供 docx 的老式文件）")

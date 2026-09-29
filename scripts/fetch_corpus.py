@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import http.cookiejar
 import json
 import re
 import sys
@@ -47,6 +48,124 @@ TREE_API = f"https://api.github.com/repos/{REPO}/git/trees/{BRANCH}?recursive=1"
 
 USER_AGENT = "china-law-skill/1.0 (offline corpus builder)"
 INFO_MARK = "<!-- INFO END -->"
+
+# 国内站点直连（不吃本机代理），避免代理规则干扰；其余站点（如 GitHub raw）仍走系统代理。
+DIRECT_HOST_SUFFIX = (".npc.gov.cn", ".cucloud.cn")
+# 只有主站 API 后面挂着 WAF；签名下载链接指向 OBS 对象存储，不受限流影响，
+# 所以节流必须按主机分开——否则几千个文件下载会被 API 的退避节奏一起拖死。
+THROTTLED_HOST_SUFFIX = ("flk.npc.gov.cn",)
+
+# flk 前面挂着网宿 WAF：首次访问会 302 回**同一个地址**并下发 wzws_cid cookie，
+# 带 cookie 重放才放行。用裸 urlopen 不存 cookie，就会报
+# "HTTP Error 302: redirect error that would lead to an infinite loop"。
+# 所以这里挂一个进程级共享 cookie 罐，一次触发、后续请求复用。
+COOKIE_JAR = http.cookiejar.CookieJar()
+_OPENERS: dict[bool, urllib.request.OpenerDirector] = {}
+
+class AdaptiveLimiter:
+    """自适应请求节流，仿 TCP 拥塞控制。
+
+    flk 的 WAF 在突发请求下会返回**空响应**（下游表现为 json 解析失败
+    "Expecting value: line 1 column 1 (char 0)"），静默几十秒到几分钟就恢复。
+    固定间隔两头不讨好：调小了被锁死，调大了白白拉长几小时。所以：
+
+      · 乘性退让——一旦被判限流，间隔 ×2（上限 max_interval），并立即冷却一拍；
+      · 加性收回——连续 recover_after 次成功才 ×0.8，最低回到 min_interval；
+      · 可选持久化——把当前间隔写盘，重跑时从学到的值起步，不重新踩一遍坑。
+    """
+
+    def __init__(
+        self,
+        min_interval: float = 0.35,
+        max_interval: float = 120.0,
+        recover_after: int = 6,
+        long_cooldown: float = 300.0,
+        long_cooldown_after: int = 4,
+        recover_factor: float = 0.7,
+        state_path: Path | None = None,
+    ) -> None:
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+        self.recover_after = recover_after
+        self.long_cooldown = long_cooldown
+        self.long_cooldown_after = long_cooldown_after
+        self.recover_factor = recover_factor
+        self.state_path = Path(state_path) if state_path else None
+        self.interval = min_interval
+        self.ok_streak = 0
+        self.throttle_streak = 0
+        self._last = 0.0
+        self._load()
+
+    # ---- 持久化 ---- #
+    def _load(self) -> None:
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.interval = min(self.max_interval, max(self.min_interval, float(saved["interval"])))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _save(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"interval": round(self.interval, 3)}), encoding="utf-8")
+            tmp.replace(self.state_path)
+        except OSError:
+            pass  # 记不住不影响抓取
+
+    # ---- 节流 ---- #
+    def wait(self) -> None:
+        gap = self.interval - (time.monotonic() - self._last)
+        if gap > 0:
+            time.sleep(gap)
+        self._last = time.monotonic()
+
+    def note_success(self) -> None:
+        self.throttle_streak = 0
+        self.ok_streak += 1
+        if self.ok_streak >= self.recover_after and self.interval > self.min_interval:
+            self.interval = max(self.min_interval, self.interval * self.recover_factor)
+            self.ok_streak = 0
+            print(f"      ⏱ 限流已缓解，请求间隔收紧到 {self.interval:.2f}s")
+            self._save()
+
+    def note_throttled(self, reason: str = "") -> None:
+        self.ok_streak = 0
+        self.throttle_streak += 1
+        before = self.interval
+        self.interval = min(self.max_interval, max(self.min_interval, self.interval * 2))
+        if self.interval != before:
+            print(f"      ⏱ 触发限流（{reason}），请求间隔放宽到 {self.interval:.2f}s")
+            self._save()
+        if self.throttle_streak >= self.long_cooldown_after:
+            # 连着被拦说明顶着封锁打没有意义：长时间静默，再折半回来试探
+            print(
+                f"      ⏱ 连续 {self.throttle_streak} 次限流，长冷却 {self.long_cooldown:.0f}s 后重试"
+            )
+            time.sleep(self.long_cooldown)
+            self.throttle_streak = 0
+            self.interval = max(self.min_interval, self.interval / 2)
+            self._save()
+        else:
+            time.sleep(self.interval)  # 冷却一拍，别继续顶着封锁打
+
+
+LIMITER = AdaptiveLimiter()
+
+
+def _opener(direct: bool) -> urllib.request.OpenerDirector:
+    """按「是否直连」缓存 opener；两者都带上共享 cookie 罐。"""
+    if direct not in _OPENERS:
+        handlers: list = [urllib.request.HTTPCookieProcessor(COOKIE_JAR)]
+        if direct:
+            handlers.append(urllib.request.ProxyHandler({}))
+        _OPENERS[direct] = urllib.request.build_opener(*handlers)
+    return _OPENERS[direct]
 
 CONSTITUTION_CODE = 100
 CATEGORIES = [
@@ -91,21 +210,53 @@ def http_get(url: str, data: bytes | None = None, timeout: int = 60, retries: in
     if data is not None:
         headers["Content-Type"] = "application/json;charset=utf-8"
     last_error: Exception | None = None
+    host = urllib.parse.urlsplit(url).hostname or ""
+    throttled = host.endswith(THROTTLED_HOST_SUFFIX)
     for attempt in range(retries):
         try:
+            if throttled:
+                LIMITER.wait()
             request = urllib.request.Request(url, data=data, headers=headers)
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+            direct = host.endswith(DIRECT_HOST_SUFFIX)
+            with _opener(direct).open(request, timeout=timeout) as response:
+                body = response.read()
+            if not body.strip():
+                if throttled:
+                    LIMITER.note_throttled("空响应")
+                raise RuntimeError("空响应（疑似被 WAF 限流）")
+            head = body[:200].lstrip().lower()
+            if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+                # WAF 的人机校验页：等一会儿再来，硬打只会延长封锁
+                if throttled:
+                    LIMITER.note_throttled("HTML 挑战页")
+                raise RuntimeError("返回 HTML 挑战页（疑似被 WAF 限流）")
+            if throttled:
+                LIMITER.note_success()
+            return body
         except Exception as exc:  # noqa: BLE001 - 网络错误种类多，统一重试
             last_error = exc
+            if throttled and "WAF" not in str(exc):
+                LIMITER.note_throttled(type(exc).__name__)
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"请求失败：{url}（{last_error}）")
 
 
-def http_json(url: str, payload: dict | None = None, timeout: int = 60) -> dict:
+def http_json(url: str, payload: dict | None = None, timeout: int = 60, retries: int = 3) -> dict:
+    """取 JSON。响应不是 JSON（多为 WAF 限流的空响应）时用长退避重试。"""
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    raw = http_get(url, data=body, timeout=timeout)
-    return json.loads(raw.decode("utf-8", "replace"))
+    last_error: Exception | None = None
+    for attempt in range(max(1, retries)):
+        raw = http_get(url, data=body, timeout=timeout)
+        try:
+            return json.loads(raw.decode("utf-8", "replace"))
+        except ValueError as exc:  # noqa: PERF203 - 限流窗口需要等待
+            last_error = exc
+            head = raw[:120].decode("utf-8", "replace").replace("\n", " ")
+            print(f"      ⚠ 响应不是 JSON（第 {attempt + 1} 次，疑似限流）：{head!r}")
+            if (urllib.parse.urlsplit(url).hostname or "").endswith(THROTTLED_HOST_SUFFIX):
+                LIMITER.note_throttled("非 JSON 响应")
+            time.sleep(5.0 * (attempt + 1))
+    raise RuntimeError(f"响应始终不是 JSON：{url}（{last_error}）")
 
 
 # --------------------------------------------------------------------------- #

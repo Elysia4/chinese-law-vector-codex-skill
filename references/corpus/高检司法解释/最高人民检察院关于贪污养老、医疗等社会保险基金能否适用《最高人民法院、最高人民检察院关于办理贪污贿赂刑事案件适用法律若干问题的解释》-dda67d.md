@@ -1,21 +1,21 @@
 ---
 title: "最高人民检察院关于贪污养老、医疗等社会保险基金能否适用《最高人民法院、最高人民检察院关于办理贪污贿赂刑事案件适用法律若干问题的解释》第一条第二款第一项规定的批复"
-category: "高法司法解释"
+category: "高检司法解释"
 layer: "current"
-status: "未标注（官方库未收录该件状态）"
-promulgated: ""
+status: "现行有效"
+promulgated: "2017-07-26"
 effective: "2017-08-07"
-effective_source: "text"
-issuer: ""
+effective_source: "official"
+issuer: "最高人民检察院"
 doc_number: ""
 source: "官方 docx"
-official_url: ""
+official_url: "https://flk.npc.gov.cn/detail?id=402881e45ffbbe41015ffc9e7eb710c9"
 record_date: "20170726"
 ---
 
 # 最高人民检察院关于贪污养老、医疗等社会保险基金能否适用《最高人民法院、最高人民检察院关于办理贪污贿赂刑事案件适用法律若干问题的解释》第一条第二款第一项规定的批复
 
-> 【未标注（官方库未收录该件状态）】　公布：—　施行：2017-08-07（正文推定）　制定机关：—　文号：—
+> 【现行有效】　公布：2017-07-26　施行：2017-08-07　制定机关：最高人民检察院　文号：—
 
 关于贪污养老、医疗等社会保险基金能否适用《最高人民法院  最高人民检察院关于办理
 

@@ -87,6 +87,10 @@ LAYER_NAME = {
 }
 DECISION_PAT = re.compile(r"关于(修改|废止|修改和废止)|修改、废止的决定|^.*关于修改《")
 ILLEGAL = re.compile(r'[\\/:*?"<>|]')
+# 官方在标题/文件名尾部给已失效的件加「（失效）」。配对是拿"标题+公布日期"做键的，
+# 所以两边必须用同一套规范化：文件名侧由 split_name() 剥掉，官方标题侧在
+# fetch_official() 里剥掉，否则这些件永远配不上（实测 58 件全部落空）。
+VOID_PAT = re.compile(r"[（(](失效|已失效)[)）]\s*$")
 # Windows 资源管理器的 zip 处理器在条目路径超过约 260 字节时会把整个包判为无效
 # （实测 258 字节可读、270 字节打不开）。这里留余量，按 UTF-8 字节数截断文件名。
 PACKAGE_ENTRY_PREFIX = "china-law/references/corpus/"
@@ -180,11 +184,17 @@ def fetch_official() -> dict[tuple[str, str], dict]:
             rows, total = _fetch_category(code)
             for row in rows:
                 title = re.sub(r"<[^>]+>", "", row.get("title") or "")
+                title = VOID_PAT.sub("", title).strip()
                 date = (row.get("gbrq") or "").replace("-", "")
-                if title and date:
+                # 不能因为缺公布日期就丢掉：「有关法律问题的决定」里有 81 件
+                # （全国人大及其常委会的决定、决议）官方就是没有 gbrq 字段，
+                # 官网给它们的文件名是「标题_.docx」。丢掉的话既抓不到、
+                # 也永远配不上（旧语料里它们只能以"状态未确认"混着）。
+                if title:
                     merged.setdefault((title, date), row)
-            # 至少抓两次：单次抓取可能因为分页重叠而缺条目
-            if attempt >= 1 and total and len(merged) >= total:
+            # 单页类目（total ≤ pageSize）不存在分页抖动，抓到齐就收工；
+            # 多页类目至少抓两次：单次抓取可能因为分页重叠而缺条目。
+            if total and len(merged) >= total and (attempt >= 1 or total <= 200):
                 break
             if total and len(merged) < total:
                 print(f"      类目 {name}：第 {attempt + 1} 次去重后 {len(merged)}/{total}，补抓…")
@@ -195,7 +205,9 @@ def fetch_official() -> dict[tuple[str, str], dict]:
                 "category": name,
                 "status_code": row.get("sxx"),
                 "status": STATUS_NAME.get(row.get("sxx"), "未知"),
-                "promulgated": row.get("gbrq"),
+                # 有些件官方就是没有公布日期（「有关法律问题的决定」81 件），
+                # 统一成空串，避免下游拿到 None 后 .replace() 崩掉。
+                "promulgated": row.get("gbrq") or "",
                 "effective": row.get("sxrq"),
                 "issuer": row.get("zdjgName") or "",
                 "bbbs": row.get("bbbs") or "",
@@ -243,9 +255,6 @@ def read_downloads(sources: list[str]) -> list[dict]:
                         }
                     )
     return files
-
-
-VOID_PAT = re.compile(r"[（(](失效|已失效)[)）]\s*$")
 
 
 def split_name(filename: str) -> tuple[str, str | None, bool]:
@@ -680,6 +689,17 @@ def main(argv: list[str] | None = None) -> int:
 
     print("[3/5] 匹配官方状态并分层…")
     by_title = official_by_title(official)
+    # 官网生成文件名时把标题里的空格和「、」统一写成「+」；split_name() 还原成
+    # 「、」后与官方标题里的空格对不上（实测 9 件司法解释/决议）。再兜一层
+    # "去掉分隔符"的规范化键，两边都规范再比，避免这类排版差异把件漏掉。
+
+    def _norm_key(text: str) -> str:
+        return re.sub(r"[\s、·]+", "", text)
+
+    by_norm: dict[str, list[dict]] = defaultdict(list)
+    for (_title, _date), _meta in official.items():
+        by_norm[_norm_key(_title)].append({**_meta, "date": _date})
+
     records, unmatched = [], []
     for f in files:
         title, date, voided = split_name(f["name"])
@@ -690,7 +710,11 @@ def main(argv: list[str] | None = None) -> int:
             # 因此混进默认检索层）。改为比较日期来判断版本关系：
             #   文件日期 > 官方最新 → 多为含"打包修正"的合并文本（官方 gbrq 只记独立公布日）
             #   文件日期 < 官方最新 → 该文件是被取代的旧版
-            cands = sorted(by_title.get(title, []), key=lambda x: x["date"], reverse=True)
+            cands = sorted(
+                by_title.get(title) or by_norm.get(_norm_key(title)) or [],
+                key=lambda x: x["date"],
+                reverse=True,
+            )
             newest = cands[0] if cands else None
             stamp = f"{date[:4]}-{date[4:6]}-{date[6:]}" if date else ""
             if newest and date and date > newest["date"]:
@@ -731,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
         records.append(
             {
                 "title": title,
-                "date": date or (meta or {}).get("promulgated", "").replace("-", ""),
+                "date": date or ((meta or {}).get("promulgated") or "").replace("-", ""),
                 "ext": f["ext"],
                 "data": f["bytes"],
                 "zip": f["zip"],
@@ -926,6 +950,27 @@ def main(argv: list[str] | None = None) -> int:
     (out_root / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
     )
+    # 清理旧语料残留：本脚本只写不删，一旦改了类目归属或配对逻辑，上一版的文件
+    # 会留在盘上变成重复条目（实测 11 个：9 件联合司法解释过去因配对失败被塞进
+    # 「高法司法解释」、2 件决议的类目也变了）。只清 corpus/<类目>/ 下的 .md，
+    # corpus 根目录的文件（law-index.md 之类）不动。
+    keep = {Path(r["file"]).relative_to("corpus").as_posix() for r in manifest_records}
+    stale = [
+        p
+        for p in out_root.rglob("*.md")
+        if len(p.relative_to(out_root).parts) >= 2 and p.relative_to(out_root).as_posix() not in keep
+    ]
+    for p in stale:
+        p.unlink()
+    if stale:
+        print(f"  清理旧语料残留 {len(stale)} 个文件")
+        for p in stale[:10]:
+            print(f"    - {p.relative_to(out_root).as_posix()}")
+    for d in sorted((d for d in out_root.rglob("*") if d.is_dir()), key=lambda x: -len(x.parts)):
+        try:
+            d.rmdir()  # 类目整体搬走后留下的空目录
+        except OSError:
+            pass
     print(f"完成：{len(manifest_records)} 件")
     print(f"  分层: {manifest['by_layer']}")
     print(f"  状态: {manifest['by_status']}")
