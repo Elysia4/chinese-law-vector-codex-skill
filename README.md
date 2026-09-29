@@ -142,7 +142,8 @@ china-law/
 │   ├── queries.jsonl           开发集（30 题，快速迭代用）
 │   ├── queries-100.jsonl       主测试集（100 题，10 个领域各 10 题）
 │   ├── law-titles.tsv          语料内全部合法标题（出题时逐字复制用）
-│   └── results.md              实测结果（三档配置 + 款级重排 + 读数纪律）
+│   ├── behavior.jsonl          行为评测用例（自伤风险 / 红线 / 先问后答）
+│   └── results.md              实测结果（三档配置 + 款级重排 + 行为评测记录）
 ├── scripts/
 │   ├── rank_search.py          条文级相关性检索（BM25 + 可选向量融合）
 │   ├── search_corpus.py        关键词 / 条文号精确检索
