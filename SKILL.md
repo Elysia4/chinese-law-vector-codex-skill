@@ -170,6 +170,19 @@ python scripts/rank_search.py --no-vector 某个问题              # 临时只�
 3. 读文件头的 YAML frontmatter，确认 `promulgated`（公布）、`effective`（施行）、`effective_source`（施行日期的来源）、`status`（时效性）；
 4. 引用时写明法律全称 + 条文号 + 该版本施行日期。
 
+### 检索审计与回答闸门
+
+检索输出会附带审计状态，回答前按以下顺序检查：事实是否足够、是否完成检索、向量索引是否与当前语料一致、是否核对版本元数据。`rank_search.py` 默认显示人类可读状态；`--audit-json` 输出机器可读状态，`--strict` 在索引哈希失配时以非零状态退出。
+
+向量索引的 `vectors.meta.json` 保存当前检索层的 `corpus_hash`、`metadata_hash` 和 `clause_hashes`。检索时会按法律名、条文号、正文、效力状态和检索层重新计算并比较。哈希失配、旧索引缺少哈希或索引覆盖不足时，系统会明确标记并退回 BM25；这只能说明语料与索引不一致，不能证明本地语料是最新法律。
+
+回答闸门遵循以下规则：事实不足时先追问；只使用 BM25 或索引过期时采用条件式表达；涉及“现行/最新/是否废止”且未在线核验时不得作确定的时效性承诺；完成事实、检索、哈希和版本核对后才能给出正常的条件式分析。
+
+```bash
+python scripts/rank_search.py "合同解除" --audit-json
+python scripts/rank_search.py "合同解除" --strict
+```
+
 其他参考文件：
 
 - `references/corpus/manifest.json`：全部收录规范的清单（含标题、类目、层、时效性、公布/施行日期、文号、官方链接、文件路径、条文数）。要确认某部法律/司法解释是否收录、或想知道某件是否已废止，查它；浏览用 `search_corpus.py --list`、`--stats`。

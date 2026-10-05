@@ -34,6 +34,7 @@ from rank_search import (  # noqa: E402  复用 HTTP 层与条文切分逻辑
     load_documents,
     load_manifest,
 )
+from audit_state import fingerprint_metadata  # noqa: E402
 
 def ollama_status(base: str) -> dict | None:
     try:
@@ -143,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     documents = load_documents(corpus_root, manifest, args.law or "", layers)
     keys = [doc_key(doc) for doc in documents]
     texts = [doc_text(doc) for doc in documents]
+    fingerprints = fingerprint_metadata(documents)
     print(f"待嵌入条文 {len(texts)} 条，模型 {args.model}（检索层：{'全部' if args.all_layers else '现行层'}）")
 
     start = 0
@@ -152,11 +154,17 @@ def main(argv: list[str] | None = None) -> int:
         old_keys, old_vectors, old_meta = previous
         same_model = old_meta.get("model") == args.model
         prefix_ok = old_keys == keys[: len(old_keys)]
-        if same_model and prefix_ok and len(old_keys) < len(keys):
+        expected_prefix = fingerprint_metadata(documents[: len(old_keys)])
+        hash_ok = (
+            old_meta.get("corpus_hash") == fingerprints["corpus_hash"]
+            if not old_meta.get("partial")
+            else old_meta.get("corpus_hash") == expected_prefix["corpus_hash"]
+        )
+        if same_model and prefix_ok and hash_ok and len(old_keys) < len(keys):
             start = len(old_keys)
             pieces.append(old_vectors)
             print(f"检测到已完成 {start} 条，从第 {start + 1} 条继续（--rebuild 可重来）")
-        elif same_model and prefix_ok:
+        elif same_model and prefix_ok and hash_ok:
             print("索引已是最新，无需重建。")
             return 0
         else:
@@ -181,7 +189,13 @@ def main(argv: list[str] | None = None) -> int:
                 corpus_root,
                 keys[:done],
                 np.vstack(pieces),
-                {"model": args.model, "dim": dimension, "count": done, "partial": True},
+                {
+                    "model": args.model,
+                    "dim": dimension,
+                    "count": done,
+                    "partial": True,
+                    **fingerprint_metadata(documents[:done]),
+                },
             )
 
     matrix = np.vstack(pieces)
@@ -194,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         "ollama_url": args.ollama_url,
         "corpus_count": len(keys),
         "doc_text": "法律名 + 条文号 + 章节 + 正文",
+        **fingerprints,
     }
     save(corpus_root, keys, matrix, meta)
     print(f"\n完成：{matrix.shape[0]} 条 × {matrix.shape[1]} 维，已写入 vectors.npz")

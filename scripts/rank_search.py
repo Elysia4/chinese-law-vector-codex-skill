@@ -41,6 +41,7 @@ import urllib.request
 from pathlib import Path
 
 from fetch_corpus import format_live_items, live_hint, live_search, stale_note
+from audit_state import compare_index
 
 # 容忍「第二百七十一 条」这类条号内混入空白的情况（docx 解析的现实）
 ARTICLE_RE = re.compile(r"^第[零一二三四五六七八九十一百千万两]+\s*条")
@@ -536,6 +537,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--chars", type=int, default=500, help="每条条文显示的字数上限")
     parser.add_argument("--verbose", action="store_true", help="显示词项与命中统计（排查用）")
     parser.add_argument("--no-vector", action="store_true", help="只用 BM25，不做向量融合")
+    parser.add_argument("--audit-json", action="store_true", help="只输出机器可读审计状态 JSON")
+    parser.add_argument("--strict", action="store_true", help="索引审计失败时以非零状态退出")
     parser.add_argument(
         "--include-repealed", action="store_true", help="同时检索已修改/已废止的历史版本"
     )
@@ -592,30 +595,47 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     terms, added = build_terms(args.text, expansions)
-    bm25_ranked = search(documents, terms, args.verbose)
+    bm25_ranked = search(documents, terms, args.verbose and not args.audit_json)
 
-    print(f'查询："{args.text}"')
-    if args.layers != ("current",):
+    if not args.audit_json:
+        print(f'查询："{args.text}"')
+    if args.layers != ("current",) and not args.audit_json:
         print(
             "检索层："
             + "、".join(LAYER_LABEL.get(x, x) for x in args.layers)
             + "（含历史版本，引用前务必核对状态）"
         )
-    if added:
+    if added and not args.audit_json:
         print(f"口语/罪名扩展：{'、'.join(added)}（权重 {WEIGHT_EXPANSION}，低于直接命中）")
 
     vector_hits: list[tuple[str, float]] = []
     index = None if args.no_vector else load_vector_index(args.corpus_root)
+    index_status = "disabled" if args.no_vector else ("missing" if index is None else "unverified")
+    hash_report = None
     if args.no_vector:
         note = "仅 BM25（已用 --no-vector 关闭向量检索）"
     elif index is not None:
+        # 用当前检索层的完整语料做哈希；--law 只收窄查询候选，不应让完整索引误报失配。
+        audit_documents = load_documents(args.corpus_root, manifest, "", args.layers)
+        hash_report = compare_index(index["meta"], audit_documents)
+        if hash_report["status"] != "valid":
+            index_status = "stale"
+            index = None
+            note = "仅 BM25（向量索引哈希与当前语料不匹配，已降级；请重建索引）"
+        else:
+            index_status = "valid"
         # 语料重建过但索引没重建时，旧向量会挂到错误的条文上，这里直接退回 BM25。
         # 注意方向：--law 会把 documents 收窄成子集，所以要看"当前条文有多少能在索引里找到"。
-        index_keys = set(index["keys"])
+        if index is None:
+            index_keys = set()
+        else:
+            index_keys = set(index["keys"])
         current_keys = [doc_key(doc) for doc in documents]
         covered = sum(1 for key in current_keys if key in index_keys) / max(1, len(current_keys))
         # 正常情况覆盖率是 100%，所以阈值可以卡得很紧，用 99% 换取灵敏度
-        if covered < 0.99:
+        if index is None:
+            pass
+        elif covered < 0.99:
             # 覆盖率不足有两种原因，给的建议完全不同：
             #   a) 索引是默认只对现行层建的，而这次开了 --include-repealed / --all-layers
             #   b) 语料变了但索引没重建
@@ -654,7 +674,38 @@ def main(argv: list[str] | None = None) -> int:
                 )
     else:
         note = "仅 BM25（未建向量索引，可用 python scripts/build_vectors.py 建立）"
-    print(f"检索方式：{note}")
+    if not args.audit_json:
+        print(f"检索方式：{note}")
+    if hash_report is not None and not args.audit_json:
+        print(f"索引审计：{hash_report['status']}（变化条文 {len(hash_report['changed_clauses'])}）")
+    if args.audit_json:
+        audit = {
+            "stage": "retrieved" if bm25_ranked or vector_hits else "no_results",
+            "retrieval": {
+                "layers": list(args.layers),
+                "method": "bm25_vector_rrf" if vector_hits else "bm25",
+                "candidate_count": len(bm25_ranked),
+                "historical_included": any(layer != "current" for layer in args.layers),
+            },
+            "index": {
+                "status": index_status,
+                "hash_match": hash_report["status"] == "valid" if hash_report else False,
+                "changed_clauses": hash_report["changed_clauses"] if hash_report else [],
+            },
+            "verification": {
+                "metadata_checked": False,
+                "live_checked": False,
+            },
+            "answer_gate": {
+                "status": "conditional" if index_status in {"stale", "missing", "disabled"} else "allowed",
+                "allowed": True,
+                "reason": "retrieval_audit_only",
+            },
+        }
+        print(json.dumps(audit, ensure_ascii=False, indent=2))
+        if args.strict and index_status == "stale":
+            return 2
+        return 0
 
     # 语料太久没更新就提醒一句——用户「忘了更新」是最常见的过期来源
     caution = stale_note(args.corpus_root)
